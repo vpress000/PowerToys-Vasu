@@ -3731,6 +3731,8 @@ LRESULT APIENTRY MainWndProc(
     static DWORD	g_DrawingShape = 0;
     // Keyboard single-use override to select a drawing shape (DRAW_RECTANGLE, DRAW_ELLIPSE, DRAW_LINE, DRAW_ARROW)
     static DWORD	g_KeyboardShapeOverride = 0;
+    static BOOLEAN  g_ShowShapeHint = FALSE;
+    static WCHAR    g_ShapeHintText[128] = {0};
     static DWORD    prevPenWidth = g_PenWidth;
     static POINT	g_RectangleAnchor;
     static RECT		g_rcRectangle;
@@ -5267,22 +5269,38 @@ LRESULT APIENTRY MainWndProc(
             } 
             break;
 
-        case VK_UP:
-            SendMessage( hWnd, WM_MOUSEWHEEL, 
-                MAKEWPARAM( GetAsyncKeyState( VK_LCONTROL ) != 0 || GetAsyncKeyState( VK_RCONTROL ) != 0 ? 
-                        MK_CONTROL: 0, WHEEL_DELTA), 0 );
-            return TRUE;
+        case 'L':
+        case 'R':
+        case 'O':
+        case 'A':
+            // Keyboard shortcuts to select drawing shapes for the next click.
+            // L -> Straight Line, R -> Rectangle, O -> Ellipse, A -> Arrow
+            if( (g_Zoomed || g_TimerActive) && (g_TypeMode == TypeModeOff)) {
+                DWORD desiredShape = 0;
+                if (wParam == 'L') {
+                    desiredShape = DRAW_LINE;
+                    wcscpy_s(g_ShapeHintText, L"Selected shape: Straight Line (L)");
+                }
+                else if (wParam == 'R') {
+                    desiredShape = DRAW_RECTANGLE;
+                    wcscpy_s(g_ShapeHintText, L"Selected shape: Rectangle (R)");
+                }
+                else if (wParam == 'O') {
+                    desiredShape = DRAW_ELLIPSE;
+                    wcscpy_s(g_ShapeHintText, L"Selected shape: Ellipse (O)");
+                }
+                else if (wParam == 'A') {
+                    desiredShape = DRAW_ARROW;
+                    wcscpy_s(g_ShapeHintText, L"Selected shape: Arrow (A)");
+                }
 
-        case VK_DOWN:
-            SendMessage( hWnd, WM_MOUSEWHEEL, 
-                MAKEWPARAM( GetAsyncKeyState( VK_LCONTROL ) != 0 || GetAsyncKeyState( VK_RCONTROL ) != 0 ? 
-                        MK_CONTROL: 0, -WHEEL_DELTA), 0 );
-            return TRUE;
-
-        case VK_LEFT:
-        case VK_RIGHT:
-            if( wParam == VK_RIGHT ) delta = 10;
-            else					  delta = -10;
+                g_KeyboardShapeOverride = desiredShape;
+                g_ShowShapeHint = TRUE;
+                // show hint for 1.5 seconds (timer id 4 is unused)
+                SetTimer(hWnd, 4, 1500, NULL);
+                InvalidateRect( hWnd, NULL, FALSE );
+            }
+            break;
             if( g_TimerActive && (breakTimeout > 0 || delta )) {
 
                 if( breakTimeout < 0 ) breakTimeout = 0;
@@ -6693,6 +6711,14 @@ LRESULT APIENTRY MainWndProc(
                 SendMessage(hWnd, WM_MOUSEMOVE, 0, MAKELPARAM(mousePos.x, mousePos.y));
             }
             break;
+
+        case 4:
+            // Clear shape hint
+            g_ShowShapeHint = FALSE;
+            g_ShapeHintText[0] = 0;
+            KillTimer( hWnd, 4 );
+            InvalidateRect( hWnd, NULL, FALSE );
+            break;
         }
         break;
 
@@ -6848,6 +6874,24 @@ LRESULT APIENTRY MainWndProc(
 
             // Copy to screen
             BitBlt( ps.hdc, 0, 0, width, height, hdcScreenCompat, 0, 0, SRCCOPY|CAPTUREBLT  );
+        }
+
+        // Draw the shape hint overlay if requested
+        if (g_ShowShapeHint && g_ShapeHintText[0] != 0) {
+            // Use the window DC (ps.hdc) which is the paint DC
+            SetTextColor(ps.hdc, RGB(255, 255, 255));
+            SetBkMode(ps.hdc, TRANSPARENT);
+            HFONT hOld = static_cast<HFONT>(SelectObject(ps.hdc, hTypingFont));
+
+            RECT hintRc;
+            hintRc.left = 10;
+            hintRc.top = 10;
+            hintRc.right = width - 10;
+            hintRc.bottom = 10 + 32; // small area for hint
+
+            DrawTextW(ps.hdc, g_ShapeHintText, -1, &hintRc, DT_SINGLELINE | DT_NOPREFIX);
+
+            SelectObject(ps.hdc, hOld);
         }
         EndPaint(hWnd, &ps); 
         return TRUE;
