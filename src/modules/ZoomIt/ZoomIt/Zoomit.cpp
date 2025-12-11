@@ -1618,6 +1618,23 @@ INT_PTR CALLBACK AdvancedBreakProc( HWND hDlg, UINT message, WPARAM wParam, LPAR
                         IsDlgButtonChecked( hDlg, IDC_CHECK_BACKGROUND_FILE) == BST_CHECKED );				
             }
             break;
+
+        case 'L':
+        case 'R':
+        case 'O':
+        case 'A':
+            // Keyboard shortcuts to select drawing shapes for the next click.
+            // L -> Straight Line, R -> Rectangle, O -> Ellipse, A -> Arrow
+            if( (g_Zoomed || g_TimerActive) && (g_TypeMode == TypeModeOff)) {
+                DWORD desiredShape = 0;
+                if (wParam == 'L') desiredShape = DRAW_LINE;
+                else if (wParam == 'R') desiredShape = DRAW_RECTANGLE;
+                else if (wParam == 'O') desiredShape = DRAW_ELLIPSE;
+                else if (wParam == 'A') desiredShape = DRAW_ARROW;
+
+                g_KeyboardShapeOverride = desiredShape;
+            }
+            break;
         }
         switch ( LOWORD( wParam )) {
         case IDC_SOUND_BROWSE:
@@ -3712,6 +3729,8 @@ LRESULT APIENTRY MainWndProc(
     static P_TYPED_KEY	typedKeyList = NULL;
     static BOOLEAN	g_HaveDrawn = FALSE;
     static DWORD	g_DrawingShape = 0;
+    // Keyboard single-use override to select a drawing shape (DRAW_RECTANGLE, DRAW_ELLIPSE, DRAW_LINE, DRAW_ARROW)
+    static DWORD	g_KeyboardShapeOverride = 0;
     static DWORD    prevPenWidth = g_PenWidth;
     static POINT	g_RectangleAnchor;
     static RECT		g_rcRectangle;
@@ -5081,13 +5100,15 @@ LRESULT APIENTRY MainWndProc(
             break;
         }
         switch (wParam) { 
-        case 'R':
         case 'B':
         case 'Y':
-        case 'O':
         case 'G':
         case 'X':
         case 'P':
+        // Red moved from 'R' -> 'T' to free 'R' for rectangle shortcut
+        case 'T':
+        // Orange moved from 'O' -> 'U' to free 'O' for ellipse shortcut
+        case 'U':
             if( (g_Zoomed || g_TimerActive) && (g_TypeMode == TypeModeOff)) {
             
                 PDWORD	penColor;
@@ -5096,11 +5117,11 @@ LRESULT APIENTRY MainWndProc(
                 else
                     penColor = &g_PenColor;
 
-                if( wParam == 'R' )		 *penColor = COLOR_RED;
+                if( wParam == 'T' )		 *penColor = COLOR_RED;
                 else if( wParam == 'G' ) *penColor = COLOR_GREEN;
                 else if( wParam == 'B' ) *penColor = COLOR_BLUE;
                 else if( wParam == 'Y' ) *penColor = COLOR_YELLOW;
-                else if( wParam == 'O' ) *penColor = COLOR_ORANGE;
+                else if( wParam == 'U' ) *penColor = COLOR_ORANGE;
                 else if( wParam == 'P' ) *penColor = COLOR_PINK;
                 else if( wParam == 'X' )
                 {
@@ -5648,22 +5669,29 @@ LRESULT APIENTRY MainWndProc(
 
             } else if( g_Drawing ) {
 
-                // is the user drawing a rectangle?
-                if( wParam & MK_CONTROL ||
-                    wParam & MK_SHIFT ||
-                    GetKeyState( VK_TAB ) < 0 ) {
+                // is the user drawing a rectangle? (also honor keyboard-shape override)
+                if( (wParam & MK_CONTROL) ||
+                    (wParam & MK_SHIFT) ||
+                    (GetKeyState( VK_TAB ) < 0) ||
+                    (g_KeyboardShapeOverride != 0) ) {
 
                     // Restore area where cursor was previously
                     RestoreCursorArea( hdcScreenCompat, hdcScreenCursorCompat, prevPt );
 
-                    if( wParam & MK_SHIFT && wParam & MK_CONTROL )
-                        g_DrawingShape = DRAW_ARROW;
-                    else if( wParam & MK_CONTROL ) 
-                        g_DrawingShape = DRAW_RECTANGLE;
-                    else if( wParam & MK_SHIFT )
-                        g_DrawingShape = DRAW_LINE;
-                    else
-                        g_DrawingShape = DRAW_ELLIPSE;
+                    if (g_KeyboardShapeOverride != 0) {
+                        // Use the keyboard-selected shape, single-use
+                        g_DrawingShape = g_KeyboardShapeOverride;
+                        g_KeyboardShapeOverride = 0;
+                    } else {
+                        if( (wParam & MK_SHIFT) && (wParam & MK_CONTROL) )
+                            g_DrawingShape = DRAW_ARROW;
+                        else if( wParam & MK_CONTROL ) 
+                            g_DrawingShape = DRAW_RECTANGLE;
+                        else if( wParam & MK_SHIFT )
+                            g_DrawingShape = DRAW_LINE;
+                        else
+                            g_DrawingShape = DRAW_ELLIPSE;
+                    }
                     g_RectangleAnchor.x = LOWORD(lParam);
                     g_RectangleAnchor.y = HIWORD(lParam);
                     SetRect(&g_rcRectangle, g_RectangleAnchor.x, g_RectangleAnchor.y, 
