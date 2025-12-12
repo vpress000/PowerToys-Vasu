@@ -112,6 +112,12 @@ typedef enum {
     TypeModeRightJustify
 } TypeModeState;
 
+// Globals referenced by code above their original local definitions.
+BOOLEAN g_TimerActive = FALSE;
+BOOLEAN g_Zoomed = FALSE;
+TypeModeState g_TypeMode = TypeModeOff;
+DWORD g_KeyboardShapeOverride = 0;
+
 const DWORD CURSOR_ARM_LENGTH = 4;
 
 const float NORMAL_BLUR_RADIUS = 20;
@@ -3708,9 +3714,6 @@ LRESULT APIENTRY MainWndProc(
     static HBITMAP	hbmpCompat, hbmpDrawingCompat, hbmpCursorCompat;
     static RECT     cropRc{};
     static BITMAP	bmp;
-    static BOOLEAN	g_TimerActive = FALSE;
-    static BOOLEAN	g_Zoomed = FALSE;
-    static TypeModeState g_TypeMode = TypeModeOff;
     static BOOLEAN	g_HaveTyped = FALSE;
     static DEVMODE	secondaryDevMode;
     static RECT		g_LiveZoomSourceRect;
@@ -3730,7 +3733,6 @@ LRESULT APIENTRY MainWndProc(
     static BOOLEAN	g_HaveDrawn = FALSE;
     static DWORD	g_DrawingShape = 0;
     // Keyboard single-use override to select a drawing shape (DRAW_RECTANGLE, DRAW_ELLIPSE, DRAW_LINE, DRAW_ARROW)
-    static DWORD	g_KeyboardShapeOverride = 0;
     static BOOLEAN  g_ShowShapeHint = FALSE;
     static WCHAR    g_ShapeHintText[128] = {0};
     static DWORD    prevPenWidth = g_PenWidth;
