@@ -69,15 +69,6 @@ COLORREF	g_CustomColors[16];
 #define DEMOTYPE_HOTKEY		    10
 #define DEMOTYPE_RESET_HOTKEY    11
 
-// Tool update message for deferred (non-blocking) UI updates
-#define WM_TOOL_UPDATE (WM_APP + 0x100)
-
-// Tool update action codes
-#define TOOLACT_UPDATE_PENCOLOR 1
-#define TOOLACT_BG_WHITE 2
-#define TOOLACT_BG_BLACK 3
-#define TOOLACT_ERASE_ALL 4
-
 #define ZOOM_PAGE	  0
 #define LIVE_PAGE	  1
 #define DRAW_PAGE	  2
@@ -131,6 +122,7 @@ BOOLEAN g_SelectionMode = FALSE; // Selection tool active
 BOOLEAN g_PanMode = FALSE; // Hand/pan tool active
 typedef enum { BG_TRANSPARENT = 0, BG_WHITE = 1, BG_BLACK = 2 } BackgroundMode;
 BackgroundMode g_BackgroundMode = BG_TRANSPARENT;
+BOOLEAN g_DrawingDiamond = FALSE; // diamond shape modifier
 
 const DWORD CURSOR_ARM_LENGTH = 4;
 
@@ -1610,49 +1602,6 @@ INT_PTR CALLBACK AdvancedBreakProc( HWND hDlg, UINT message, WPARAM wParam, LPAR
         }
         SendMessage( GetDlgItem( hDlg, IDC_OPACITY ), CB_SETCURSEL, 
                 g_BreakOpacity / 10 - 1, 0 );
-        return TRUE;
-    
-    case WM_TOOL_UPDATE:
-        // Deferred tool updates to avoid doing heavy GDI work in key handler
-        switch( wParam ) {
-        case TOOLACT_UPDATE_PENCOLOR:
-            // Update drawing pen and text color
-            DeleteObject( hDrawingPen );
-            SetTextColor( hdcScreenCompat, g_PenColor & 0xFFFFFF );
-            hDrawingPen = CreatePen(PS_SOLID, g_PenWidth, g_PenColor & 0xFFFFFF);
-            SelectObject( hdcScreenCompat, hDrawingPen );
-            break;
-        case TOOLACT_BG_WHITE:
-            // Paint a white background while preserving drawing layer
-            BitBlt(hdcScreenCompat, 0, 0, bmp.bmWidth, bmp.bmHeight, hdcScreenSaveCompat, 0, 0, SRCCOPY | CAPTUREBLT);
-            {
-                HBRUSH hBr = CreateSolidBrush(RGB(255,255,255));
-                FillRect(hdcScreenCompat, &boundRc, hBr);
-                DeleteObject(hBr);
-            }
-            InvalidateRect( hWnd, NULL, TRUE );
-            break;
-        case TOOLACT_BG_BLACK:
-            BitBlt(hdcScreenCompat, 0, 0, bmp.bmWidth, bmp.bmHeight, hdcScreenSaveCompat, 0, 0, SRCCOPY | CAPTUREBLT);
-            {
-                HBRUSH hBr = CreateSolidBrush(RGB(0,0,0));
-                FillRect(hdcScreenCompat, &boundRc, hBr);
-                DeleteObject(hBr);
-            }
-            InvalidateRect( hWnd, NULL, TRUE );
-            break;
-        case TOOLACT_ERASE_ALL:
-            if (g_HaveDrawn) {
-                BitBlt(hdcScreenCompat, 0, 0, bmp.bmWidth, bmp.bmHeight, hdcScreenSaveCompat, 0, 0, SRCCOPY | CAPTUREBLT);
-                g_HaveDrawn = FALSE;
-                // clear undo stack
-                while (drawUndoList) { PopDrawUndo(hdcScreenCompat, &drawUndoList, width, height); }
-                InvalidateRect( hWnd, NULL, TRUE );
-            }
-            break;
-        default:
-            break;
-        }
         return TRUE;
 
     case WM_COMMAND:
@@ -5168,6 +5117,63 @@ LRESULT APIENTRY MainWndProc(
             bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
             int key = static_cast<int>(wParam);
 
+            // If user is holding Ctrl, check for Ctrl+color and Ctrl+duplicate mappings first.
+            if (ctrl) {
+                switch( toupper(key) ) {
+                case 'R':
+                    g_PenColor = COLOR_RED | (0xFF << 24);
+                    break;
+                case 'G':
+                    g_PenColor = COLOR_GREEN | (0xFF << 24);
+                    break;
+                case 'B':
+                    g_PenColor = COLOR_BLUE | (0xFF << 24);
+                    break;
+                case 'O':
+                    g_PenColor = COLOR_ORANGE | (0xFF << 24);
+                    break;
+                case 'P':
+                    g_PenColor = COLOR_PINK | (0xFF << 24);
+                    break;
+                case 'W':
+                    g_PenColor = RGB(255,255,255) | (0xFF << 24);
+                    break;
+                case 'K':
+                    g_PenColor = RGB(0,0,0) | (0xFF << 24);
+                    break;
+                case 'D':
+                    // Ctrl+D -> duplicate selected objects (best-effort: duplicate whole drawing layer offset)
+                    if (g_SelectionMode && g_HaveDrawn) {
+                        PushDrawUndo(hdcScreenCompat, &drawUndoList, width, height);
+                        HDC hTemp = CreateCompatibleDC(hdcScreenCompat);
+                        HBITMAP hDup = CreateCompatibleBitmap(hdcScreenCompat, bmp.bmWidth, bmp.bmHeight);
+                        HBITMAP hOld = (HBITMAP)SelectObject(hTemp, hDup);
+                        // copy current drawing into dup and blit back offset by 12,12
+                        BitBlt(hTemp, 0, 0, bmp.bmWidth, bmp.bmHeight, hdcScreenCompat, 0, 0, SRCCOPY);
+                        BitBlt(hdcScreenCompat, 12, 12, bmp.bmWidth, bmp.bmHeight, hTemp, 0, 0, SRCCOPY);
+                        SelectObject(hTemp, hOld);
+                        DeleteObject(hDup);
+                        DeleteDC(hTemp);
+                        g_HaveDrawn = TRUE;
+                        InvalidateRect(hWnd, NULL, TRUE);
+                    }
+                    break;
+                default:
+                    break;
+                }
+
+                // After applying a Ctrl+color, update pen and registry
+                if (toupper(key) == 'R' || toupper(key) == 'G' || toupper(key) == 'B' || toupper(key) == 'O' ||
+                    toupper(key) == 'P' || toupper(key) == 'W' || toupper(key) == 'K') {
+                    PDWORD penColor = g_TimerActive ? &g_BreakPenColor : &g_PenColor;
+                    *penColor = g_PenColor;
+                    reg.WriteRegSettings( RegSettings );
+                    DeleteObject( hDrawingPen );
+                    hDrawingPen = CreatePen(PS_SOLID, g_PenWidth, *penColor & 0xFFFFFF);
+                    SelectObject( hdcScreenCompat, hDrawingPen );
+                }
+            }
+
             switch( toupper(key) ) {
             case 'V': // Selection tool (or '1')
             case '1':
@@ -5214,18 +5220,25 @@ LRESULT APIENTRY MainWndProc(
                 break;
             case 'E': case '0':
                 if (ctrl) {
-                    // Ctrl+E -> Erase All (defer heavy operation)
-                    PostMessage(hWnd, WM_TOOL_UPDATE, TOOLACT_ERASE_ALL, 0);
+                    // Ctrl+E -> Erase All
+                    if (g_HaveDrawn) {
+                        BitBlt(hdcScreenCompat, 0, 0, bmp.bmWidth, bmp.bmHeight, hdcScreenSaveCompat, 0, 0, SRCCOPY | CAPTUREBLT);
+                        g_HaveDrawn = FALSE;
+                        // clear undo stack
+                        while (drawUndoList) { PopDrawUndo(hdcScreenCompat, &drawUndoList, width, height); }
+                        InvalidateRect( hWnd, NULL, TRUE );
+                    }
                 } else {
-                    // Eraser tool -> set white pen (defer creation)
+                    // Eraser tool -> set white pen
                     g_Drawing = TRUE; g_DrawingShape = DRAW_LINE; g_SelectionMode = FALSE; g_PanMode = FALSE;
                     g_PenColor = (RGB(255,255,255)) | (0xFF << 24);
-                    PostMessage(hWnd, WM_TOOL_UPDATE, TOOLACT_UPDATE_PENCOLOR, 0);
+                    DeleteObject( hDrawingPen );
+                    hDrawingPen = CreatePen(PS_SOLID, g_PenWidth, g_PenColor & 0xFFFFFF);
+                    SelectObject( hdcScreenCompat, hDrawingPen );
                 }
                 break;
-                break;
             case 'Y': // Yellow pen (no Ctrl)
-                if (!ctrl) { g_PenColor = COLOR_YELLOW | (0xFF << 24); PostMessage(hWnd, WM_TOOL_UPDATE, TOOLACT_UPDATE_PENCOLOR, 0); }
+                if (!ctrl) { g_PenColor = COLOR_YELLOW | (0xFF << 24); DeleteObject(hDrawingPen); hDrawingPen = CreatePen(PS_SOLID, g_PenWidth, g_PenColor & 0xFFFFFF); SelectObject(hdcScreenCompat, hDrawingPen); }
                 break;
             default:
                 break;
@@ -5268,7 +5281,7 @@ LRESULT APIENTRY MainWndProc(
                 else
                     penColor = &g_PenColor;
 
-                if( wParam == 'T' )         *penColor = COLOR_RED;
+                if( wParam == 'T' )		 *penColor = COLOR_RED;
                 else if( wParam == 'G' ) *penColor = COLOR_GREEN;
                 else if( wParam == 'B' ) *penColor = COLOR_BLUE;
                 else if( wParam == 'Y' ) *penColor = COLOR_YELLOW;
@@ -5291,14 +5304,30 @@ LRESULT APIENTRY MainWndProc(
                     break;
                 }
 
-                // Persist the chosen color and defer heavy GDI updates to WM_TOOL_UPDATE
                 reg.WriteRegSettings( RegSettings );
-                // Request async update to pen and visuals to avoid blocking in key handler
-                PostMessage(hWnd, WM_TOOL_UPDATE, TOOLACT_UPDATE_PENCOLOR, 0);
-                if( g_Drawing ) {
-                    // ensure cursor area refresh is scheduled
-                    PostMessage(hWnd, WM_MOUSEMOVE, 0, MAKELPARAM( prevPt.x, prevPt.y ));
+                DeleteObject( hDrawingPen );
+                SetTextColor( hdcScreenCompat, *penColor );
+
+                // Highlight and blur level
+                if( shift && *penColor != COLOR_BLUR )
+                {
+                    *penColor |= (g_AlphaBlend << 24);
                 }
+                else
+                {
+                    if( *penColor == COLOR_BLUR )
+                    {
+                        g_BlurRadius = shift ? STRONG_BLUR_RADIUS : NORMAL_BLUR_RADIUS;
+                    }
+                    *penColor |= (0xFF << 24);
+                }
+                hDrawingPen = CreatePen(PS_SOLID, g_PenWidth, *penColor & 0xFFFFFF);
+
+                SelectObject( hdcScreenCompat, hDrawingPen );
+                if( g_Drawing ) {
+
+                    SendMessage( hWnd, WM_MOUSEMOVE, 0, MAKELPARAM( prevPt.x, prevPt.y ));				
+                
                 } else if( g_TimerActive ) {
     
                     InvalidateRect( hWnd, NULL, FALSE );				
