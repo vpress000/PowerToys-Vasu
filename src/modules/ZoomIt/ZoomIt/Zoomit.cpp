@@ -69,6 +69,15 @@ COLORREF	g_CustomColors[16];
 #define DEMOTYPE_HOTKEY		    10
 #define DEMOTYPE_RESET_HOTKEY    11
 
+// Tool update message for deferred (non-blocking) UI updates
+#define WM_TOOL_UPDATE (WM_APP + 0x100)
+
+// Tool update action codes
+#define TOOLACT_UPDATE_PENCOLOR 1
+#define TOOLACT_BG_WHITE 2
+#define TOOLACT_BG_BLACK 3
+#define TOOLACT_ERASE_ALL 4
+
 #define ZOOM_PAGE	  0
 #define LIVE_PAGE	  1
 #define DRAW_PAGE	  2
@@ -117,6 +126,11 @@ BOOLEAN g_TimerActive = FALSE;
 BOOLEAN g_Zoomed = FALSE;
 TypeModeState g_TypeMode = TypeModeOff;
 DWORD g_KeyboardShapeOverride = 0;
+// Tool and canvas state (Phase 1)
+BOOLEAN g_SelectionMode = FALSE; // Selection tool active
+BOOLEAN g_PanMode = FALSE; // Hand/pan tool active
+typedef enum { BG_TRANSPARENT = 0, BG_WHITE = 1, BG_BLACK = 2 } BackgroundMode;
+BackgroundMode g_BackgroundMode = BG_TRANSPARENT;
 
 const DWORD CURSOR_ARM_LENGTH = 4;
 
@@ -1596,6 +1610,49 @@ INT_PTR CALLBACK AdvancedBreakProc( HWND hDlg, UINT message, WPARAM wParam, LPAR
         }
         SendMessage( GetDlgItem( hDlg, IDC_OPACITY ), CB_SETCURSEL, 
                 g_BreakOpacity / 10 - 1, 0 );
+        return TRUE;
+    
+    case WM_TOOL_UPDATE:
+        // Deferred tool updates to avoid doing heavy GDI work in key handler
+        switch( wParam ) {
+        case TOOLACT_UPDATE_PENCOLOR:
+            // Update drawing pen and text color
+            DeleteObject( hDrawingPen );
+            SetTextColor( hdcScreenCompat, g_PenColor & 0xFFFFFF );
+            hDrawingPen = CreatePen(PS_SOLID, g_PenWidth, g_PenColor & 0xFFFFFF);
+            SelectObject( hdcScreenCompat, hDrawingPen );
+            break;
+        case TOOLACT_BG_WHITE:
+            // Paint a white background while preserving drawing layer
+            BitBlt(hdcScreenCompat, 0, 0, bmp.bmWidth, bmp.bmHeight, hdcScreenSaveCompat, 0, 0, SRCCOPY | CAPTUREBLT);
+            {
+                HBRUSH hBr = CreateSolidBrush(RGB(255,255,255));
+                FillRect(hdcScreenCompat, &boundRc, hBr);
+                DeleteObject(hBr);
+            }
+            InvalidateRect( hWnd, NULL, TRUE );
+            break;
+        case TOOLACT_BG_BLACK:
+            BitBlt(hdcScreenCompat, 0, 0, bmp.bmWidth, bmp.bmHeight, hdcScreenSaveCompat, 0, 0, SRCCOPY | CAPTUREBLT);
+            {
+                HBRUSH hBr = CreateSolidBrush(RGB(0,0,0));
+                FillRect(hdcScreenCompat, &boundRc, hBr);
+                DeleteObject(hBr);
+            }
+            InvalidateRect( hWnd, NULL, TRUE );
+            break;
+        case TOOLACT_ERASE_ALL:
+            if (g_HaveDrawn) {
+                BitBlt(hdcScreenCompat, 0, 0, bmp.bmWidth, bmp.bmHeight, hdcScreenSaveCompat, 0, 0, SRCCOPY | CAPTUREBLT);
+                g_HaveDrawn = FALSE;
+                // clear undo stack
+                while (drawUndoList) { PopDrawUndo(hdcScreenCompat, &drawUndoList, width, height); }
+                InvalidateRect( hWnd, NULL, TRUE );
+            }
+            break;
+        default:
+            break;
+        }
         return TRUE;
 
     case WM_COMMAND:
@@ -5103,6 +5160,96 @@ LRESULT APIENTRY MainWndProc(
             } 
             break;
         }
+
+        // Phase 1: Tool and mode keyboard mappings (sticky tools + shortcuts)
+        if( (g_Zoomed || g_TimerActive) && (g_TypeMode == TypeModeOff)) {
+            bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            int key = static_cast<int>(wParam);
+
+            switch( toupper(key) ) {
+            case 'V': // Selection tool (or '1')
+            case '1':
+                g_SelectionMode = TRUE; g_PanMode = FALSE; g_Drawing = FALSE; g_DrawingShape = 0;
+                InvalidateRect( hWnd, NULL, TRUE );
+                break;
+            case 'H': // Highlight (H) or Shift+H -> Pan
+                if (shift) {
+                    g_PanMode = TRUE; g_SelectionMode = FALSE; g_Drawing = FALSE;
+                } else {
+                    g_Drawing = TRUE; g_SelectionMode = FALSE; g_PanMode = FALSE; g_DrawingShape = DRAW_LINE;
+                    // Make highlight color (semi-transparent yellow)
+                    g_PenColor = COLOR_YELLOW | (g_AlphaBlend << 24);
+                    DeleteObject( hDrawingPen );
+                    hDrawingPen = CreatePen(PS_SOLID, g_PenWidth, g_PenColor & 0xFFFFFF);
+                    SelectObject( hdcScreenCompat, hDrawingPen );
+                }
+                break;
+            case 'R': case '2': // Rectangle
+                g_Drawing = TRUE; g_DrawingShape = DRAW_RECTANGLE; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                break;
+            case 'O': case '4': // Ellipse
+                g_Drawing = TRUE; g_DrawingShape = DRAW_ELLIPSE; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                break;
+            case 'A': case '5': // Arrow
+                g_Drawing = TRUE; g_DrawingShape = DRAW_ARROW; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                break;
+            case '6': // Multi-point line (falls back to line)
+                g_Drawing = TRUE; g_DrawingShape = DRAW_LINE; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                break;
+            case 'L': // Straight line
+                g_Drawing = TRUE; g_DrawingShape = DRAW_LINE; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                break;
+            case 'P': case '7': // Freehand (pen)
+                g_Drawing = TRUE; g_DrawingShape = DRAW_LINE; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                break;
+            case '8': // Text tool (use '8' to avoid color-key conflict with 'T')
+                // Enter typing mode by synthesizing the T key behavior
+                SendMessage( hWnd, WM_KEYUP, 'T', 0 );
+                break;
+            case 'D': case '3': // Diamond (approximate with rectangle flag)
+                g_Drawing = TRUE; g_DrawingShape = DRAW_RECTANGLE; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                // mark diamond via pen width negative sentinel (placeholder)
+                break;
+            case 'E': case '0':
+                if (ctrl) {
+                    // Ctrl+E -> Erase All (defer heavy operation)
+                    PostMessage(hWnd, WM_TOOL_UPDATE, TOOLACT_ERASE_ALL, 0);
+                } else {
+                    // Eraser tool -> set white pen (defer creation)
+                    g_Drawing = TRUE; g_DrawingShape = DRAW_LINE; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                    g_PenColor = (RGB(255,255,255)) | (0xFF << 24);
+                    PostMessage(hWnd, WM_TOOL_UPDATE, TOOLACT_UPDATE_PENCOLOR, 0);
+                }
+                break;
+                break;
+            case 'Y': // Yellow pen (no Ctrl)
+                if (!ctrl) { g_PenColor = COLOR_YELLOW | (0xFF << 24); PostMessage(hWnd, WM_TOOL_UPDATE, TOOLACT_UPDATE_PENCOLOR, 0); }
+                break;
+            default:
+                break;
+            }
+
+            // Background modes (Alt+W / Alt+B)
+            if (alt && (wParam == 'W' || wParam == 'w')) {
+                g_BackgroundMode = BG_WHITE;
+                // Fill background with white but preserve existing drawing layer by blitting save
+                BitBlt(hdcScreenCompat, 0, 0, bmp.bmWidth, bmp.bmHeight, hdcScreenSaveCompat, 0, 0, SRCCOPY | CAPTUREBLT);
+                HBRUSH hBr = CreateSolidBrush(RGB(255,255,255));
+                FillRect(hdcScreenCompat, &boundRc, hBr);
+                DeleteObject(hBr);
+                InvalidateRect( hWnd, NULL, TRUE );
+            } else if (alt && (wParam == 'B' || wParam == 'b')) {
+                g_BackgroundMode = BG_BLACK;
+                BitBlt(hdcScreenCompat, 0, 0, bmp.bmWidth, bmp.bmHeight, hdcScreenSaveCompat, 0, 0, SRCCOPY | CAPTUREBLT);
+                HBRUSH hBr = CreateSolidBrush(RGB(0,0,0));
+                FillRect(hdcScreenCompat, &boundRc, hBr);
+                DeleteObject(hBr);
+                InvalidateRect( hWnd, NULL, TRUE );
+            }
+        }
+
         switch (wParam) { 
         case 'B':
         case 'Y':
@@ -5121,7 +5268,7 @@ LRESULT APIENTRY MainWndProc(
                 else
                     penColor = &g_PenColor;
 
-                if( wParam == 'T' )		 *penColor = COLOR_RED;
+                if( wParam == 'T' )         *penColor = COLOR_RED;
                 else if( wParam == 'G' ) *penColor = COLOR_GREEN;
                 else if( wParam == 'B' ) *penColor = COLOR_BLUE;
                 else if( wParam == 'Y' ) *penColor = COLOR_YELLOW;
@@ -5144,30 +5291,14 @@ LRESULT APIENTRY MainWndProc(
                     break;
                 }
 
+                // Persist the chosen color and defer heavy GDI updates to WM_TOOL_UPDATE
                 reg.WriteRegSettings( RegSettings );
-                DeleteObject( hDrawingPen );
-                SetTextColor( hdcScreenCompat, *penColor );
-
-                // Highlight and blur level
-                if( shift && *penColor != COLOR_BLUR )
-                {
-                    *penColor |= (g_AlphaBlend << 24);
-                }
-                else
-                {
-                    if( *penColor == COLOR_BLUR )
-                    {
-                        g_BlurRadius = shift ? STRONG_BLUR_RADIUS : NORMAL_BLUR_RADIUS;
-                    }
-                    *penColor |= (0xFF << 24);
-                }
-                hDrawingPen = CreatePen(PS_SOLID, g_PenWidth, *penColor & 0xFFFFFF);
-
-                SelectObject( hdcScreenCompat, hDrawingPen );
+                // Request async update to pen and visuals to avoid blocking in key handler
+                PostMessage(hWnd, WM_TOOL_UPDATE, TOOLACT_UPDATE_PENCOLOR, 0);
                 if( g_Drawing ) {
-
-                    SendMessage( hWnd, WM_MOUSEMOVE, 0, MAKELPARAM( prevPt.x, prevPt.y ));				
-                
+                    // ensure cursor area refresh is scheduled
+                    PostMessage(hWnd, WM_MOUSEMOVE, 0, MAKELPARAM( prevPt.x, prevPt.y ));
+                }
                 } else if( g_TimerActive ) {
     
                     InvalidateRect( hWnd, NULL, FALSE );				
