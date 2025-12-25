@@ -112,6 +112,18 @@ typedef enum {
     TypeModeRightJustify
 } TypeModeState;
 
+// Globals referenced by code above their original local definitions.
+BOOLEAN g_TimerActive = FALSE;
+BOOLEAN g_Zoomed = FALSE;
+TypeModeState g_TypeMode = TypeModeOff;
+DWORD g_KeyboardShapeOverride = 0;
+// Tool and canvas state (Phase 1)
+BOOLEAN g_SelectionMode = FALSE; // Selection tool active
+BOOLEAN g_PanMode = FALSE; // Hand/pan tool active
+typedef enum { BG_TRANSPARENT = 0, BG_WHITE = 1, BG_BLACK = 2 } BackgroundMode;
+BackgroundMode g_BackgroundMode = BG_TRANSPARENT;
+BOOLEAN g_DrawingDiamond = FALSE; // diamond shape modifier
+
 const DWORD CURSOR_ARM_LENGTH = 4;
 
 const float NORMAL_BLUR_RADIUS = 20;
@@ -1616,6 +1628,23 @@ INT_PTR CALLBACK AdvancedBreakProc( HWND hDlg, UINT message, WPARAM wParam, LPAR
                         IsDlgButtonChecked( hDlg, IDC_CHECK_BACKGROUND_FILE) == BST_CHECKED );
                 EnableWindow( GetDlgItem( hDlg, IDC_BACKGROUND_BROWSE ), 
                         IsDlgButtonChecked( hDlg, IDC_CHECK_BACKGROUND_FILE) == BST_CHECKED );				
+            }
+            break;
+
+        case 'L':
+        case 'R':
+        case 'O':
+        case 'A':
+            // Keyboard shortcuts to select drawing shapes for the next click.
+            // L -> Straight Line, R -> Rectangle, O -> Ellipse, A -> Arrow
+            if( (g_Zoomed || g_TimerActive) && (g_TypeMode == TypeModeOff)) {
+                DWORD desiredShape = 0;
+                if (wParam == 'L') desiredShape = DRAW_LINE;
+                else if (wParam == 'R') desiredShape = DRAW_RECTANGLE;
+                else if (wParam == 'O') desiredShape = DRAW_ELLIPSE;
+                else if (wParam == 'A') desiredShape = DRAW_ARROW;
+
+                g_KeyboardShapeOverride = desiredShape;
             }
             break;
         }
@@ -3691,9 +3720,6 @@ LRESULT APIENTRY MainWndProc(
     static HBITMAP	hbmpCompat, hbmpDrawingCompat, hbmpCursorCompat;
     static RECT     cropRc{};
     static BITMAP	bmp;
-    static BOOLEAN	g_TimerActive = FALSE;
-    static BOOLEAN	g_Zoomed = FALSE;
-    static TypeModeState g_TypeMode = TypeModeOff;
     static BOOLEAN	g_HaveTyped = FALSE;
     static DEVMODE	secondaryDevMode;
     static RECT		g_LiveZoomSourceRect;
@@ -3712,6 +3738,9 @@ LRESULT APIENTRY MainWndProc(
     static P_TYPED_KEY	typedKeyList = NULL;
     static BOOLEAN	g_HaveDrawn = FALSE;
     static DWORD	g_DrawingShape = 0;
+    // Keyboard single-use override to select a drawing shape (DRAW_RECTANGLE, DRAW_ELLIPSE, DRAW_LINE, DRAW_ARROW)
+    static BOOLEAN  g_ShowShapeHint = FALSE;
+    static WCHAR    g_ShapeHintText[128] = {0};
     static DWORD    prevPenWidth = g_PenWidth;
     static POINT	g_RectangleAnchor;
     static RECT		g_rcRectangle;
@@ -5080,14 +5109,170 @@ LRESULT APIENTRY MainWndProc(
             } 
             break;
         }
+
+        // Phase 1: Tool and mode keyboard mappings (sticky tools + shortcuts)
+        if( (g_Zoomed || g_TimerActive) && (g_TypeMode == TypeModeOff)) {
+            bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            int key = static_cast<int>(wParam);
+
+            // If user is holding Ctrl, check for Ctrl+color and Ctrl+duplicate mappings first.
+            if (ctrl) {
+                switch( toupper(key) ) {
+                case 'R':
+                    g_PenColor = COLOR_RED | (0xFF << 24);
+                    break;
+                case 'G':
+                    g_PenColor = COLOR_GREEN | (0xFF << 24);
+                    break;
+                case 'B':
+                    g_PenColor = COLOR_BLUE | (0xFF << 24);
+                    break;
+                case 'O':
+                    g_PenColor = COLOR_ORANGE | (0xFF << 24);
+                    break;
+                case 'P':
+                    g_PenColor = COLOR_PINK | (0xFF << 24);
+                    break;
+                case 'W':
+                    g_PenColor = RGB(255,255,255) | (0xFF << 24);
+                    break;
+                case 'K':
+                    g_PenColor = RGB(0,0,0) | (0xFF << 24);
+                    break;
+                case 'D':
+                    // Ctrl+D -> duplicate selected objects (best-effort: duplicate whole drawing layer offset)
+                    if (g_SelectionMode && g_HaveDrawn) {
+                        PushDrawUndo(hdcScreenCompat, &drawUndoList, width, height);
+                        HDC hTemp = CreateCompatibleDC(hdcScreenCompat);
+                        HBITMAP hDup = CreateCompatibleBitmap(hdcScreenCompat, bmp.bmWidth, bmp.bmHeight);
+                        HBITMAP hOld = (HBITMAP)SelectObject(hTemp, hDup);
+                        // copy current drawing into dup and blit back offset by 12,12
+                        BitBlt(hTemp, 0, 0, bmp.bmWidth, bmp.bmHeight, hdcScreenCompat, 0, 0, SRCCOPY);
+                        BitBlt(hdcScreenCompat, 12, 12, bmp.bmWidth, bmp.bmHeight, hTemp, 0, 0, SRCCOPY);
+                        SelectObject(hTemp, hOld);
+                        DeleteObject(hDup);
+                        DeleteDC(hTemp);
+                        g_HaveDrawn = TRUE;
+                        InvalidateRect(hWnd, NULL, TRUE);
+                    }
+                    break;
+                default:
+                    break;
+                }
+
+                // After applying a Ctrl+color, update pen and registry
+                if (toupper(key) == 'R' || toupper(key) == 'G' || toupper(key) == 'B' || toupper(key) == 'O' ||
+                    toupper(key) == 'P' || toupper(key) == 'W' || toupper(key) == 'K') {
+                    PDWORD penColor = g_TimerActive ? &g_BreakPenColor : &g_PenColor;
+                    *penColor = g_PenColor;
+                    reg.WriteRegSettings( RegSettings );
+                    DeleteObject( hDrawingPen );
+                    hDrawingPen = CreatePen(PS_SOLID, g_PenWidth, *penColor & 0xFFFFFF);
+                    SelectObject( hdcScreenCompat, hDrawingPen );
+                }
+            }
+
+            switch( toupper(key) ) {
+            case 'V': // Selection tool (or '1')
+            case '1':
+                g_SelectionMode = TRUE; g_PanMode = FALSE; g_Drawing = FALSE; g_DrawingShape = 0;
+                InvalidateRect( hWnd, NULL, TRUE );
+                break;
+            case 'H': // Highlight (H) or Shift+H -> Pan
+                if (shift) {
+                    g_PanMode = TRUE; g_SelectionMode = FALSE; g_Drawing = FALSE;
+                } else {
+                    g_Drawing = TRUE; g_SelectionMode = FALSE; g_PanMode = FALSE; g_DrawingShape = DRAW_LINE;
+                    // Make highlight color (semi-transparent yellow)
+                    g_PenColor = COLOR_YELLOW | (g_AlphaBlend << 24);
+                    DeleteObject( hDrawingPen );
+                    hDrawingPen = CreatePen(PS_SOLID, g_PenWidth, g_PenColor & 0xFFFFFF);
+                    SelectObject( hdcScreenCompat, hDrawingPen );
+                }
+                break;
+            case 'R': case '2': // Rectangle
+                g_Drawing = TRUE; g_DrawingShape = DRAW_RECTANGLE; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                break;
+            case 'O': case '4': // Ellipse
+                g_Drawing = TRUE; g_DrawingShape = DRAW_ELLIPSE; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                break;
+            case 'A': case '5': // Arrow
+                g_Drawing = TRUE; g_DrawingShape = DRAW_ARROW; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                break;
+            case '6': // Multi-point line (falls back to line)
+                g_Drawing = TRUE; g_DrawingShape = DRAW_LINE; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                break;
+            case 'L': // Straight line
+                g_Drawing = TRUE; g_DrawingShape = DRAW_LINE; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                break;
+            case 'P': case '7': // Freehand (pen)
+                g_Drawing = TRUE; g_DrawingShape = DRAW_LINE; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                break;
+            case '8': // Text tool (use '8' to avoid color-key conflict with 'T')
+                // Enter typing mode by synthesizing the T key behavior
+                SendMessage( hWnd, WM_KEYUP, 'T', 0 );
+                break;
+            case 'D': case '3': // Diamond (approximate with rectangle flag)
+                g_Drawing = TRUE; g_DrawingShape = DRAW_RECTANGLE; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                // mark diamond via pen width negative sentinel (placeholder)
+                break;
+            case 'E': case '0':
+                if (ctrl) {
+                    // Ctrl+E -> Erase All
+                    if (g_HaveDrawn) {
+                        BitBlt(hdcScreenCompat, 0, 0, bmp.bmWidth, bmp.bmHeight, hdcScreenSaveCompat, 0, 0, SRCCOPY | CAPTUREBLT);
+                        g_HaveDrawn = FALSE;
+                        // clear undo stack
+                        while (drawUndoList) { PopDrawUndo(hdcScreenCompat, &drawUndoList, width, height); }
+                        InvalidateRect( hWnd, NULL, TRUE );
+                    }
+                } else {
+                    // Eraser tool -> set white pen
+                    g_Drawing = TRUE; g_DrawingShape = DRAW_LINE; g_SelectionMode = FALSE; g_PanMode = FALSE;
+                    g_PenColor = (RGB(255,255,255)) | (0xFF << 24);
+                    DeleteObject( hDrawingPen );
+                    hDrawingPen = CreatePen(PS_SOLID, g_PenWidth, g_PenColor & 0xFFFFFF);
+                    SelectObject( hdcScreenCompat, hDrawingPen );
+                }
+                break;
+            case 'Y': // Yellow pen (no Ctrl)
+                if (!ctrl) { g_PenColor = COLOR_YELLOW | (0xFF << 24); DeleteObject(hDrawingPen); hDrawingPen = CreatePen(PS_SOLID, g_PenWidth, g_PenColor & 0xFFFFFF); SelectObject(hdcScreenCompat, hDrawingPen); }
+                break;
+            default:
+                break;
+            }
+
+            // Background modes (Alt+W / Alt+B)
+            if (alt && (wParam == 'W' || wParam == 'w')) {
+                g_BackgroundMode = BG_WHITE;
+                // Fill background with white but preserve existing drawing layer by blitting save
+                BitBlt(hdcScreenCompat, 0, 0, bmp.bmWidth, bmp.bmHeight, hdcScreenSaveCompat, 0, 0, SRCCOPY | CAPTUREBLT);
+                HBRUSH hBr = CreateSolidBrush(RGB(255,255,255));
+                FillRect(hdcScreenCompat, &boundRc, hBr);
+                DeleteObject(hBr);
+                InvalidateRect( hWnd, NULL, TRUE );
+            } else if (alt && (wParam == 'B' || wParam == 'b')) {
+                g_BackgroundMode = BG_BLACK;
+                BitBlt(hdcScreenCompat, 0, 0, bmp.bmWidth, bmp.bmHeight, hdcScreenSaveCompat, 0, 0, SRCCOPY | CAPTUREBLT);
+                HBRUSH hBr = CreateSolidBrush(RGB(0,0,0));
+                FillRect(hdcScreenCompat, &boundRc, hBr);
+                DeleteObject(hBr);
+                InvalidateRect( hWnd, NULL, TRUE );
+            }
+        }
+
         switch (wParam) { 
-        case 'R':
         case 'B':
         case 'Y':
-        case 'O':
         case 'G':
         case 'X':
         case 'P':
+        // Red moved from 'R' -> 'T' to free 'R' for rectangle shortcut
+        case 'T':
+        // Orange moved from 'O' -> 'U' to free 'O' for ellipse shortcut
+        case 'U':
             if( (g_Zoomed || g_TimerActive) && (g_TypeMode == TypeModeOff)) {
             
                 PDWORD	penColor;
@@ -5096,11 +5281,11 @@ LRESULT APIENTRY MainWndProc(
                 else
                     penColor = &g_PenColor;
 
-                if( wParam == 'R' )		 *penColor = COLOR_RED;
+                if( wParam == 'T' )		 *penColor = COLOR_RED;
                 else if( wParam == 'G' ) *penColor = COLOR_GREEN;
                 else if( wParam == 'B' ) *penColor = COLOR_BLUE;
                 else if( wParam == 'Y' ) *penColor = COLOR_YELLOW;
-                else if( wParam == 'O' ) *penColor = COLOR_ORANGE;
+                else if( wParam == 'U' ) *penColor = COLOR_ORANGE;
                 else if( wParam == 'P' ) *penColor = COLOR_PINK;
                 else if( wParam == 'X' )
                 {
@@ -5246,22 +5431,38 @@ LRESULT APIENTRY MainWndProc(
             } 
             break;
 
-        case VK_UP:
-            SendMessage( hWnd, WM_MOUSEWHEEL, 
-                MAKEWPARAM( GetAsyncKeyState( VK_LCONTROL ) != 0 || GetAsyncKeyState( VK_RCONTROL ) != 0 ? 
-                        MK_CONTROL: 0, WHEEL_DELTA), 0 );
-            return TRUE;
+        case 'L':
+        case 'R':
+        case 'O':
+        case 'A':
+            // Keyboard shortcuts to select drawing shapes for the next click.
+            // L -> Straight Line, R -> Rectangle, O -> Ellipse, A -> Arrow
+            if( (g_Zoomed || g_TimerActive) && (g_TypeMode == TypeModeOff)) {
+                DWORD desiredShape = 0;
+                if (wParam == 'L') {
+                    desiredShape = DRAW_LINE;
+                    wcscpy_s(g_ShapeHintText, L"Selected shape: Straight Line (L)");
+                }
+                else if (wParam == 'R') {
+                    desiredShape = DRAW_RECTANGLE;
+                    wcscpy_s(g_ShapeHintText, L"Selected shape: Rectangle (R)");
+                }
+                else if (wParam == 'O') {
+                    desiredShape = DRAW_ELLIPSE;
+                    wcscpy_s(g_ShapeHintText, L"Selected shape: Ellipse (O)");
+                }
+                else if (wParam == 'A') {
+                    desiredShape = DRAW_ARROW;
+                    wcscpy_s(g_ShapeHintText, L"Selected shape: Arrow (A)");
+                }
 
-        case VK_DOWN:
-            SendMessage( hWnd, WM_MOUSEWHEEL, 
-                MAKEWPARAM( GetAsyncKeyState( VK_LCONTROL ) != 0 || GetAsyncKeyState( VK_RCONTROL ) != 0 ? 
-                        MK_CONTROL: 0, -WHEEL_DELTA), 0 );
-            return TRUE;
-
-        case VK_LEFT:
-        case VK_RIGHT:
-            if( wParam == VK_RIGHT ) delta = 10;
-            else					  delta = -10;
+                g_KeyboardShapeOverride = desiredShape;
+                g_ShowShapeHint = TRUE;
+                // show hint for 1.5 seconds (timer id 4 is unused)
+                SetTimer(hWnd, 4, 1500, NULL);
+                InvalidateRect( hWnd, NULL, FALSE );
+            }
+            break;
             if( g_TimerActive && (breakTimeout > 0 || delta )) {
 
                 if( breakTimeout < 0 ) breakTimeout = 0;
@@ -5648,22 +5849,29 @@ LRESULT APIENTRY MainWndProc(
 
             } else if( g_Drawing ) {
 
-                // is the user drawing a rectangle?
-                if( wParam & MK_CONTROL ||
-                    wParam & MK_SHIFT ||
-                    GetKeyState( VK_TAB ) < 0 ) {
+                // is the user drawing a rectangle? (also honor keyboard-shape override)
+                if( (wParam & MK_CONTROL) ||
+                    (wParam & MK_SHIFT) ||
+                    (GetKeyState( VK_TAB ) < 0) ||
+                    (g_KeyboardShapeOverride != 0) ) {
 
                     // Restore area where cursor was previously
                     RestoreCursorArea( hdcScreenCompat, hdcScreenCursorCompat, prevPt );
 
-                    if( wParam & MK_SHIFT && wParam & MK_CONTROL )
-                        g_DrawingShape = DRAW_ARROW;
-                    else if( wParam & MK_CONTROL ) 
-                        g_DrawingShape = DRAW_RECTANGLE;
-                    else if( wParam & MK_SHIFT )
-                        g_DrawingShape = DRAW_LINE;
-                    else
-                        g_DrawingShape = DRAW_ELLIPSE;
+                    if (g_KeyboardShapeOverride != 0) {
+                        // Use the keyboard-selected shape, single-use
+                        g_DrawingShape = g_KeyboardShapeOverride;
+                        g_KeyboardShapeOverride = 0;
+                    } else {
+                        if( (wParam & MK_SHIFT) && (wParam & MK_CONTROL) )
+                            g_DrawingShape = DRAW_ARROW;
+                        else if( wParam & MK_CONTROL ) 
+                            g_DrawingShape = DRAW_RECTANGLE;
+                        else if( wParam & MK_SHIFT )
+                            g_DrawingShape = DRAW_LINE;
+                        else
+                            g_DrawingShape = DRAW_ELLIPSE;
+                    }
                     g_RectangleAnchor.x = LOWORD(lParam);
                     g_RectangleAnchor.y = HIWORD(lParam);
                     SetRect(&g_rcRectangle, g_RectangleAnchor.x, g_RectangleAnchor.y, 
@@ -6665,6 +6873,14 @@ LRESULT APIENTRY MainWndProc(
                 SendMessage(hWnd, WM_MOUSEMOVE, 0, MAKELPARAM(mousePos.x, mousePos.y));
             }
             break;
+
+        case 4:
+            // Clear shape hint
+            g_ShowShapeHint = FALSE;
+            g_ShapeHintText[0] = 0;
+            KillTimer( hWnd, 4 );
+            InvalidateRect( hWnd, NULL, FALSE );
+            break;
         }
         break;
 
@@ -6820,6 +7036,24 @@ LRESULT APIENTRY MainWndProc(
 
             // Copy to screen
             BitBlt( ps.hdc, 0, 0, width, height, hdcScreenCompat, 0, 0, SRCCOPY|CAPTUREBLT  );
+        }
+
+        // Draw the shape hint overlay if requested
+        if (g_ShowShapeHint && g_ShapeHintText[0] != 0) {
+            // Use the window DC (ps.hdc) which is the paint DC
+            SetTextColor(ps.hdc, RGB(255, 255, 255));
+            SetBkMode(ps.hdc, TRANSPARENT);
+            HFONT hOld = static_cast<HFONT>(SelectObject(ps.hdc, hTypingFont));
+
+            RECT hintRc;
+            hintRc.left = 10;
+            hintRc.top = 10;
+            hintRc.right = width - 10;
+            hintRc.bottom = 10 + 32; // small area for hint
+
+            DrawTextW(ps.hdc, g_ShapeHintText, -1, &hintRc, DT_SINGLELINE | DT_NOPREFIX);
+
+            SelectObject(ps.hdc, hOld);
         }
         EndPaint(hWnd, &ps); 
         return TRUE;
